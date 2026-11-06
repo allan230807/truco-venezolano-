@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview --host",
     "test": "vitest run",
-    "torneo": "vite-node tests/torneo.ts"
+    "torneo": "vite-node tests/torneo.ts",
+    "safari": "node tests/safari/server.cjs"
   },
   "dependencies": {
     "three": "^0.170.0"

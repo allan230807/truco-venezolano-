@@ -3,3 +3,4 @@ node_modules/
 *.log
 *.pdf
 .vite/
+tests/safari/out/

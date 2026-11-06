@@ -4,12 +4,14 @@ import { Card, cardName, enviteInfo, makeRng, pieces, trucoPower } from './engin
 import { Action, GameEvent, GameState, TRUCO_NAMES, Team, applyAction, faltaAmount, handInfo, legalActions, newMatch, nextBase, partnerOf, teamOf } from './engine/game';
 import { BOTS, BotProfile, botById } from './ai/bots';
 import { Memory, decide, maybeSignal, newMemory, observe } from './ai/brain';
-import { CardTag, cardFace, faceCanvas } from './ui/art';
+import { CardTag, cardBack, cardFace, faceCanvas } from './ui/art';
 import { TableScene } from './ui/scene';
 import { Sound } from './ui/audio';
 
 const HUMAN = 0;
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Espera según la velocidad elegida en opciones. */
+const paced = (ms: number) => wait(ms * SPEEDS[settings.speed]);
 const hud = document.getElementById('hud')!;
 const stage = document.getElementById('stage')!;
 const scene = new TableScene(document.getElementById('game') as HTMLCanvasElement);
@@ -17,7 +19,7 @@ const snd = new Sound();
 const rng = makeRng((Date.now() ^ (Math.random() * 1e9)) >>> 0);
 
 function fit(): void {
-  const k = Math.min(innerWidth / 960, innerHeight / 672);
+  const k = Math.min(innerWidth / 1280, innerHeight / 720);
   stage.style.transform = `scale(${k}) translate(-50%, -50%)`;
 }
 addEventListener('resize', fit); fit();
@@ -28,11 +30,14 @@ function store<T>(key: string, fallback: T): T { try { const v = localStorage.ge
 function save(key: string, v: unknown): void { try { localStorage.setItem(key, JSON.stringify(v)); } catch { /* sin almacenamiento */ } }
 
 // ---------- Ajustes ----------
-interface Settings { music: boolean; sfx: boolean; voices: boolean; filter: boolean; hints: boolean; open: boolean; mode: 2 | 4; rival: number; partner: number }
-const settings: Settings = { music: true, sfx: true, voices: false, filter: true, hints: true, open: true, mode: 4, rival: 5, partner: 5, ...store<Partial<Settings>>('truco-settings', {}) };
+type Speed = 'pausado' | 'normal' | 'rapido';
+const SPEEDS: Record<Speed, number> = { pausado: 1, normal: .65, rapido: .38 };
+interface Settings { music: boolean; sfx: boolean; voices: boolean; filter: boolean; hints: boolean; open: boolean; mode: 2 | 4; rival: number; partner: number; speed: Speed }
+const settings: Settings = { music: true, sfx: true, voices: false, filter: true, hints: true, open: true, mode: 4, rival: 5, partner: 5, speed: 'pausado', ...store<Partial<Settings>>('truco-settings', {}) };
 function applySettings(): void {
   snd.setMusic(settings.music); snd.sfx = settings.sfx; snd.voices = settings.voices;
-  scene.setStrength(settings.filter ? 1 : .15);
+  scene.setStrength(settings.filter ? 1 : .12);
+  scene.pace = SPEEDS[settings.speed];
   save('truco-settings', settings);
 }
 applySettings();
@@ -54,7 +59,7 @@ class Match {
   state!: GameState; mems: Memory[] = []; bots = new Map<number, BotProfile>(); alive = true;
   shown: [number, number] = [0, 0]; log: string[] = []; panelResolve: ((a: Action) => void) | null = null;
   hiddenMode = false; killMode = false; florWarned = false; signaled = false; root = el('div'); plates = new Map<number, HTMLElement>();
-  private peekCard: Card | null = null;
+  private peekCard: Card | null = null; private peekOpen = false; private peekTimer = 0;
 
   constructor(public mode: 2 | 4, rival: BotProfile, partner: BotProfile | null, public open: boolean) {
     this.bots.set(1, rival);
@@ -114,14 +119,29 @@ class Match {
   // --- Bots ---
   private async botAction(seat: number): Promise<Action> {
     const prof = this.bots.get(seat)!;
-    const plate = this.plates.get(seat);
-    plate?.classList.add('think');
+    const forced = legalActions(this.state).length === 1;
     const d = decide(this.state, seat, prof, this.mems[seat], rng);
-    const fast = this.state.pending!.kind !== 'turn' ? 420 : 330;
-    await wait(fast + rng() * 420 + (d.action.t === 'truco' || d.action.t === 'retruco' ? 260 : 0));
-    plate?.classList.remove('think');
-    if (d.speech) { this.bubble(seat, d.speech); scene.talk(seat); await wait(360); }
+    // Temporizador: cuanto más importa la jugada y más sabe el bot, más la piensa.
+    const big = d.action.t === 'truco' || d.action.t === 'retruco' || d.action.t === 'envido' || d.action.t === 'flor-envida' || d.action.t === 'privo';
+    const base = forced ? 700 : this.state.pending!.kind === 'turn' ? 1700 : 1500;
+    const ms = (base + (forced ? 0 : rng() * 1500 + prof.stars * 55) + (big ? 750 : 0)) * SPEEDS[settings.speed];
+    await this.thinkTimer(seat, ms);
+    if (!this.alive) return d.action;
+    if (d.speech) { this.bubble(seat, d.speech); scene.talk(seat); await paced(800); }
     return d.action;
+  }
+
+  private thinkTimer(seat: number, ms: number): Promise<void> {
+    const plate = this.plates.get(seat);
+    const bar = plate?.querySelector<HTMLElement>('.timer i');
+    plate?.classList.add('think');
+    scene.setThinking(seat, true);
+    if (bar) {
+      bar.style.transition = 'none'; bar.style.width = '100%';
+      void bar.offsetWidth; // Reinicia la barra antes de animarla.
+      bar.style.transition = `width ${ms}ms linear`; bar.style.width = '0%';
+    }
+    return wait(ms).then(() => { plate?.classList.remove('think'); scene.setThinking(seat, false); });
   }
 
   // --- Interfaz fija ---
@@ -133,8 +153,6 @@ class Match {
     const vira = el('div', 'frame'); vira.id = 'vira'; r.append(vira);
     const log = el('div', 'frame'); log.id = 'log'; r.append(log);
     const panel = el('div'); panel.id = 'panel'; r.append(panel);
-    const hint = el('div'); hint.id = 'hint'; r.append(hint);
-    const info = el('div'); info.id = 'envite-info'; r.append(info);
     const menu = el('button', 'frame btn', 'PAUSA'); menu.id = 'menu-btn';
     menu.onclick = () => openPause(); r.append(menu);
     this.plates.clear();
@@ -144,10 +162,11 @@ class Match {
       plate.append(faceCanvas(p.look));
       const who = el('div', 'who', `<b>${esc(p.name)}</b><span class="tag"></span>`);
       plate.append(who);
+      plate.append(el('div', 'timer', '<i></i>'));
       const pos = this.screenSeat(seat);
-      if (pos === 'top') { plate.style.left = '488px'; plate.style.top = '10px'; }
-      if (pos === 'left') { plate.style.left = '256px'; plate.style.top = '92px'; }
-      if (pos === 'right') { plate.style.right = '236px'; plate.style.top = '92px'; }
+      if (pos === 'top') { plate.style.left = '770px'; plate.style.top = '10px'; }
+      if (pos === 'left') { plate.style.left = '10px'; plate.style.top = '126px'; }
+      if (pos === 'right') { plate.style.right = '10px'; plate.style.top = '10px'; }
       r.append(plate); this.plates.set(seat, plate);
     }
     this.renderScore();
@@ -164,6 +183,7 @@ class Match {
   private renderVira(s: GameState): void {
     const box = this.root.querySelector('#vira')!;
     const p = pieces(s.vira);
+    const envite = this.root.querySelector('#envite-info')?.textContent ?? '';
     box.innerHTML = '<div class="h">LA VIRA</div>';
     const row = el('div', 'pieces');
     for (const [label, card] of [['Vira', s.vira], ['Perico', p.perico], ['Perica', p.perica]] as [string, Card][]) {
@@ -171,6 +191,7 @@ class Match {
     }
     box.append(row);
     box.append(el('div', 'pips', '<span>Vueltas</span><span class="pip" data-t="0"></span><span class="pip" data-t="1"></span><span class="pip" data-t="2"></span>'));
+    const info = el('div', '', esc(envite)); info.id = 'envite-info'; box.append(info);
   }
   private renderPeek(s: GameState): void {
     this.root.querySelector('#peek')?.remove();
@@ -180,10 +201,42 @@ class Match {
     const card = s.peeks[partner];
     if (!card) return;
     this.peekCard = card;
-    const box = el('div', 'frame'); box.id = 'peek';
-    box.append(miniCard(card));
-    box.append(el('div', '', `${esc(this.name(partner))} tiene<br><span style="color:var(--gold)">${esc(cardName(card, s.vira))}</span>`));
+    this.peekOpen = false;
+    const box = el('button', 'frame click'); box.id = 'peek'; box.type = 'button';
+    box.onclick = () => { snd.unlock(); this.togglePeek(); };
     this.root.append(box);
+    this.renderPeekBox();
+  }
+  private renderPeekBox(): void {
+    const box = this.root.querySelector('#peek');
+    if (!box || !this.peekCard) return;
+    const s = this.state;
+    const name = this.name(partnerOf(HUMAN, s.n)!);
+    box.innerHTML = '';
+    if (box.classList.contains('gone')) {
+      box.append(miniCard(this.peekCard));
+      box.append(el('div', '', `${esc(name)} ya la jugó`));
+      return;
+    }
+    if (this.peekOpen) {
+      box.append(miniCard(this.peekCard));
+      box.append(el('div', '', `${esc(name)} tiene<br><span style="color:var(--gold)">${esc(cardName(this.peekCard, s.vira))}</span>`));
+    } else {
+      const back = document.createElement('canvas'); const src = cardBack();
+      back.width = src.width; back.height = src.height; back.getContext('2d')!.drawImage(src, 0, 0);
+      box.append(back);
+      box.append(el('div', '', `Carta de ${esc(name)}<br><span style="color:var(--gold)">Toca para verla (V)</span>`));
+    }
+  }
+  /** Muestra la carta del compañero un momento; se tapa sola o al tocarla otra vez. */
+  togglePeek(): void {
+    if (!this.peekCard || this.root.querySelector('#peek')?.classList.contains('gone')) return;
+    this.peekOpen = !this.peekOpen;
+    clearTimeout(this.peekTimer);
+    scene.showPartnerCard(this.peekOpen);
+    snd.play('flip');
+    this.renderPeekBox();
+    if (this.peekOpen) this.peekTimer = window.setTimeout(() => { if (this.peekOpen && this.alive) this.togglePeek(); }, 5000);
   }
   private setTurn(seat: number): void {
     this.plates.forEach((p, s) => p.classList.toggle('turn', s === seat));
@@ -207,20 +260,20 @@ class Match {
   bubble(seat: number, text: string, cls = ''): void {
     const b = el('div', `bubble ${cls}`, esc(text));
     const pos = this.screenSeat(seat);
-    if (pos === 'bottom') { b.style.left = '430px'; b.style.bottom = '206px'; }
-    if (pos === 'top') { b.style.left = '470px'; b.style.top = '66px'; }
-    if (pos === 'left') { b.style.left = '256px'; b.style.top = '148px'; }
-    if (pos === 'right') { b.style.right = '236px'; b.style.top = '148px'; }
+    if (pos === 'bottom') { b.style.left = '520px'; b.style.bottom = '258px'; }
+    if (pos === 'top') { b.style.left = '770px'; b.style.top = '72px'; }
+    if (pos === 'left') { b.style.left = '10px'; b.style.top = '190px'; }
+    if (pos === 'right') { b.style.right = '10px'; b.style.top = '72px'; }
     this.root.querySelectorAll(`.bubble[data-seat="${seat}"]`).forEach((x) => x.remove());
     b.dataset.seat = String(seat);
     this.root.append(b);
-    setTimeout(() => b.remove(), 1500);
+    setTimeout(() => b.remove(), 2200 * Math.max(.6, SPEEDS[settings.speed]));
   }
   async banner(text: string, cls: string, sub = '', ms = 850): Promise<void> {
     this.root.querySelector('#banner')?.remove();
     const b = el('div', cls, `${esc(text)}${sub ? `<small>${esc(sub)}</small>` : ''}`); b.id = 'banner';
     this.root.append(b);
-    await wait(ms);
+    await paced(ms);
     b.remove();
   }
   setHint(html: string): void { const h = this.root.querySelector('#hint'); if (h) h.innerHTML = html; }
@@ -238,7 +291,7 @@ class Match {
           await scene.revealTable(ev.seat, ev.card, 1);
           this.addLog(`${this.name(ev.seat)} destapa ${cardName(ev.card, this.state.vira)}`, true);
           snd.play('flip'); scene.punch(.8);
-          await this.banner('¡LA MUERTE!', 'gold', cardName(ev.card, this.state.vira), 900);
+          await this.banner('¡LA MUERTE!', 'gold', cardName(ev.card, this.state.vira), 1400);
           break;
         case 'score':
           this.shown[ev.team] = Math.min(24, this.shown[ev.team] + ev.points);
@@ -257,16 +310,15 @@ class Match {
     this.florWarned = false; this.signaled = false; this.hiddenMode = false; this.killMode = false;
     this.renderVira(s); this.renderBadges(); this.renderPeek(s);
     this.addLog(`Base ${s.baseNumber}. Mano: ${this.name(ev.mano)}`);
-    const p = pieces(s.vira);
-    const tag = (c: Card): CardTag => (c.id === p.perico.id ? 'perico' : c.id === p.perica.id ? 'perica' : null);
     const human = s.players[HUMAN].hand;
     const hands = s.players.map((pl) => pl.seat).sort((a, b) => ((a - s.mano + s.n) % s.n) - ((b - s.mano + s.n) % s.n)).map((seat) => {
-      if (seat === HUMAN) return { seat, cards: human as (Card | null)[], tags: human.map(tag) };
+      if (seat === HUMAN) return { seat, cards: human as (Card | null)[] };
       const friend = s.open && seat === partnerOf(HUMAN, s.n) ? s.peeks[seat] : null;
       return { seat, cards: [friend, null, null] as (Card | null)[] };
     });
-    await scene.deal(hands, s.vira, ev.pie, () => snd.play('deal'));
+    await scene.deal(hands, s.vira, () => snd.play('deal'));
     snd.play('flip');
+    await paced(350);
     // Señas entre compañeros bot y hacia ti.
     if (s.n === 4) {
       for (const seat of [1, 2, 3]) {
@@ -295,8 +347,8 @@ class Match {
     scene.talk(ev.seat, .8);
     const big = ev.kind === 'truco' || ev.kind === 'envite' || ev.kind === 'flor' || ev.kind === 'privo';
     this.bubble(ev.seat, ev.text, big ? ev.kind : '');
-    if (ev.text.startsWith('A Ley') && ev.kind === 'ley') { snd.play('blip'); await wait(380); return; }
-    if (ev.kind === 'mazo') { snd.play('lose'); await wait(500); return; }
+    if (ev.text.startsWith('A Ley') && ev.kind === 'ley') { snd.play('blip'); await paced(800); return; }
+    if (ev.kind === 'mazo') { snd.play('lose'); await paced(950); return; }
     if (big) {
       snd.play(ev.kind === 'truco' || ev.kind === 'privo' ? 'truco' : ev.kind === 'flor' ? 'flor' : 'envido');
       snd.say(ev.text);
@@ -304,12 +356,12 @@ class Match {
       const strength = ev.text.includes('Vale Juego') ? 1.7 : ev.text.includes('Vale Nueve') ? 1.35 : heavy ? 1 : .45;
       scene.focus(ev.seat === HUMAN ? null : ev.seat);
       scene.punch(strength); if (heavy) scene.flashScreen(.18 * strength);
-      await this.banner(ev.text.replace(/¡|!/g, '').toUpperCase(), ev.kind, name, heavy ? 950 : 720);
+      await this.banner(ev.text.replace(/¡|!/g, '').toUpperCase(), ev.kind, name, heavy ? 1500 : 1150);
       scene.focus(null);
     } else {
       snd.say(ev.text);
       snd.play(ev.text.startsWith('No') ? 'lose' : 'confirm');
-      await wait(460);
+      await paced(950);
     }
   }
   private async onPlay(ev: Extract<GameEvent, { e: 'play' }>): Promise<void> {
@@ -321,12 +373,16 @@ class Match {
     if (ev.kill) this.addLog(`${this.name(ev.seat)} mata tapado`, true);
     else if (ev.hidden) this.addLog(`${this.name(ev.seat)} pasa una carta`);
     else if (ev.card) this.addLog(`${this.name(ev.seat)}: ${cardName(ev.card, s.vira)}${ev.under ? ' (van juntas)' : ''}`);
-    if (ev.seat === partnerOf(HUMAN, s.n) && ev.card && this.peekCard?.id === ev.card.id) this.root.querySelector('#peek')?.classList.add('gone');
+    if (ev.seat === partnerOf(HUMAN, s.n) && ev.card && this.peekCard?.id === ev.card.id) {
+      clearTimeout(this.peekTimer); this.peekOpen = false;
+      this.root.querySelector('#peek')?.classList.add('gone');
+      this.renderPeekBox();
+    }
     if (heavy && ev.card) {
       scene.punch(.55);
-      if (trucoPower(ev.card, s.vira) >= 99) { scene.flashScreen(.2); await this.banner(cardName(ev.card, s.vira).toUpperCase(), 'gold', '', 520); }
+      if (trucoPower(ev.card, s.vira) >= 99) { scene.flashScreen(.2); await this.banner(cardName(ev.card, s.vira).toUpperCase(), 'gold', '', 950); }
     }
-    await wait(ev.seat === HUMAN ? 80 : 110);
+    await paced(ev.seat === HUMAN ? 240 : 380);
   }
   private async onTrick(ev: Extract<GameEvent, { e: 'trick' }>): Promise<void> {
     const pip = this.root.querySelector(`.pip[data-t="${ev.index}"]`);
@@ -336,7 +392,7 @@ class Match {
       pip?.classList.add('tie');
       snd.play('parda');
       scene.markWinner(null, ev.index);
-      await this.banner('PARDA', 'info', names[ev.index], 560);
+      await this.banner('PARDA', 'info', names[ev.index], 1200);
       return;
     }
     const ours = ev.result === teamOf(HUMAN, this.state.n);
@@ -345,7 +401,7 @@ class Match {
     scene.markWinner(ev.winnerSeat, ev.index);
     scene.hit(ev.winnerSeat ?? 0);
     this.addLog(`${names[ev.index]}: ${ev.winnerSeat !== null ? this.name(ev.winnerSeat) : ''}`);
-    await wait(380);
+    await paced(1250);
   }
   private modal(html: string, build?: (m: HTMLElement) => void): HTMLElement {
     const m = el('div', 'frame modal', html);
@@ -369,6 +425,7 @@ class Match {
     this.plates.forEach((p) => p.classList.remove('turn'));
     await scene.revealHands(ev.hands);
     const lines = ev.lines.map((l) => `<div class="ln ${l.team === 0 ? 'us' : 'them'}"><span>${esc(this.teamName(l.team))}: ${esc(l.reason)}</span><b>+${l.points >= 24 ? 'CHICO' : l.points}</b></div>`).join('');
+    await paced(700);
     const m = this.modal(`<h2>FIN DE LA BASE ${s.baseNumber}</h2>${lines || '<div class="ln">Sin puntos</div>'}`);
     const hands = el('div', 'hands');
     ev.hands.forEach((h, seat) => {
@@ -393,7 +450,7 @@ class Match {
     snd.play(ours ? 'win' : 'lose');
     scene.punch(1.1);
     const text = ev.bonito ? 'VIENE EL BONITO' : `CHICO PARA ${this.teamName(ev.team).toUpperCase()}`;
-    await this.banner(ev.bonito ? `CHICO ${ours ? 'TUYO' : 'PERDIDO'}` : text, ours ? 'gold' : 'truco', ev.bonito ? 'Viene el Bonito, el chico decisivo' : `Chicos ${ev.chicos[0]} a ${ev.chicos[1]}`, 1300);
+    await this.banner(ev.bonito ? `CHICO ${ours ? 'TUYO' : 'PERDIDO'}` : text, ours ? 'gold' : 'truco', ev.bonito ? 'Viene el Bonito, el chico decisivo' : `Chicos ${ev.chicos[0]} a ${ev.chicos[1]}`, 2000);
     this.renderScore();
     scene.setStones([0, 0], () => undefined);
   }
@@ -446,10 +503,10 @@ class Match {
       'privo-response': ['¡PRIVO Y TRUCO!', '¿Vas al Truco?'],
     };
     const t = titles[d.kind];
-    const title = el('div', 'frame title', `<span class="h">${esc(t[0])}</span><p>${esc(t[1])}</p>`);
+    const title = el('div', 'frame title', `<span class="h">${esc(t[0])}</span><p>${esc(t[1])}</p><p id="hint"></p>`);
     panel.append(title);
     const buttons = this.buttonsFor(legal);
-    const keys = 'QWERTYUIOP';
+    const keys = 'QWERTYUIOP'.replace('V', '');
     buttons.forEach((b, i) => {
       const btn = el('button', `frame canto ${b.cls}`, `<kbd>${keys[i] ?? ''}</kbd><span>${esc(b.label)}</span>`);
       btn.style.setProperty('--i', String(i));
@@ -462,7 +519,7 @@ class Match {
       scene.pickable = true;
       scene.onHover = () => snd.play('blip');
       scene.onPick = (id) => this.pickCard(id);
-      this.setHint(this.killMode ? 'Elige la carta que <b>mata tapada</b>' : this.hiddenMode ? 'Elige la carta que vas a <b>pasar tapada</b>' : 'Toca una carta, o pulsa <b>1</b> <b>2</b> <b>3</b>');
+      this.setHint(this.killMode ? 'Elige la carta que <b>mata tapada</b>' : this.hiddenMode ? 'Elige la carta que vas a <b>pasar tapada</b>' : 'Toca una carta (teclas 1 a 3)');
     }
   }
   private turnPrompt(s: GameState): string {
@@ -568,6 +625,7 @@ class Match {
     this.choose(a);
   }
   key(e: KeyboardEvent): void {
+    if (e.key === 'v' || e.key === 'V') { this.togglePeek(); return; }
     if (!this.panelResolve) return;
     if (e.key >= '1' && e.key <= '3') {
       const id = scene.handIds()[Number(e.key) - 1];
@@ -601,13 +659,22 @@ function showError(err: unknown): void {
   m.append(b); hud.append(m);
 }
 function toggles(box: HTMLElement): void {
-  const opts: [keyof Settings, string][] = [['music', 'Música'], ['sfx', 'Efectos'], ['voices', 'Voces'], ['filter', 'Filtro sucio'], ['hints', 'Ver mi Envite']];
+  const opts: ['music' | 'sfx' | 'voices' | 'filter' | 'hints', string][] = [['music', 'Música'], ['sfx', 'Efectos'], ['voices', 'Voces'], ['filter', 'Filtro sucio'], ['hints', 'Ver mi Envite']];
   opts.forEach(([key, label]) => {
     const b = el('button', 'frame opt', label);
     b.setAttribute('aria-pressed', String(settings[key]));
-    b.onclick = () => { (settings[key] as boolean) = !settings[key]; b.setAttribute('aria-pressed', String(settings[key])); applySettings(); snd.play('blip'); };
+    b.onclick = () => { settings[key] = !settings[key]; b.setAttribute('aria-pressed', String(settings[key])); applySettings(); snd.play('blip'); };
     box.append(b);
   });
+  const row = el('div', 'opts'); row.style.flexBasis = '100%'; row.style.alignItems = 'center';
+  row.append(el('span', '', 'Ritmo de los bots:'));
+  (Object.entries({ pausado: 'Pausado', normal: 'Normal', rapido: 'Rápido' }) as [Speed, string][]).forEach(([v, label]) => {
+    const b = el('button', 'frame opt', label); b.dataset.speed = v;
+    b.setAttribute('aria-pressed', String(settings.speed === v));
+    b.onclick = () => { settings.speed = v; applySettings(); snd.play('blip'); row.querySelectorAll('[data-speed]').forEach((x) => x.setAttribute('aria-pressed', String((x as HTMLElement).dataset.speed === v))); };
+    row.append(b);
+  });
+  box.append(row);
 }
 function openPause(): void {
   if (document.querySelector('#pause')) return;
@@ -630,7 +697,7 @@ const RULES = `
 <h3>FLOR</h3><p>Tres cartas del mismo palo, o una pieza con dos del mismo palo. Vale 3 piedras. Cántala antes de tu primera carta o sal A Ley y cántala antes de la segunda. Si no, se quema. Dos piezas juntas son La Reservada, que vale al menos 5.</p>
 <h3>ESTAR CANTANDO</h3><p>Con 23 piedras se canta el Envite más alto. El rival debe decir Privo y Truco si lo supera, o el chico se acaba.</p>
 <h3>JUGADAS DE VIEJO</h3><p>Pasar tapada: la carta no vale nada. Matar tapado: en segunda, el último jugador esconde la carta que mata y se revela al final. Hacer seña: tu compañero sabrá tu pieza, pero un rival experto puede pillarte.</p>
-<h3>TRUCO ABIERTO</h3><p>En parejas, cada jugador ve una carta de su compañero. Esto vale también para los bots.</p>
+<h3>TRUCO ABIERTO</h3><p>En parejas, cada jugador puede ver una carta de su compañero. Toca la carta que brilla en su mano, o pulsa V, para mirarla un momento. Los bots también ven una de su compañero.</p>
 <p style="margin-top:12px;color:var(--dim)">Resumen propio basado en "El Juego de Truco" de Francisco A. Solé.</p>`;
 function showRules(): void {
   const m = el('div', 'frame modal', `<h2>REGLAS</h2><div class="rules">${RULES}</div>`);
@@ -728,4 +795,29 @@ function showMenu(): void {
   btns.append(rules, opts, play); foot.append(btns); m.append(foot);
   hud.append(m);
 }
+// Al señalar una carta de la mesa se ve en grande, con su nombre.
+const inspector = document.createElement('div'); inspector.id = 'inspect'; inspector.hidden = true;
+stage.append(inspector);
+let inspectTimer = 0;
+let inspectedCard: string | null = null;
+scene.onInspect = (card, x, y, touch) => {
+  clearTimeout(inspectTimer);
+  if (!card) { inspector.hidden = true; inspectedCard = null; return; }
+  if (inspectedCard !== card.id) {
+    inspectedCard = card.id;
+    inspector.innerHTML = '';
+    const vira = current?.alive ? current.state?.vira : undefined;
+    const p = vira ? pieces(vira) : null;
+    const tag: CardTag = p && card.id === p.perico.id ? 'perico' : p && card.id === p.perica.id ? 'perica' : null;
+    inspector.append(miniCard(card, tag), el('div', '', esc(cardName(card, vira))));
+  }
+  inspector.hidden = false;
+  const r = stage.getBoundingClientRect();
+  const k = r.width / 1280;
+  const px = (x - r.left) / k, py = (y - r.top) / k;
+  inspector.style.left = `${Math.max(8, Math.min(1280 - 196, px + (px > 640 ? -212 : 24)))}px`;
+  inspector.style.top = `${Math.max(8, Math.min(720 - 306, py - 150))}px`;
+  if (touch) inspectTimer = window.setTimeout(() => { inspector.hidden = true; inspectedCard = null; }, 2500);
+};
+scene.onPartnerCard = () => { snd.unlock(); current?.togglePeek(); };
 showTitle();
